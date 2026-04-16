@@ -1,0 +1,348 @@
+---
+title: "RWE Câncer de Mama — Trajetórias terapêuticas no SUS"
+output: html_notebook
+data: "2026-04-12"
+#Camada prata
+---
+
+Carregando o parquet
+
+```{r}
+library(arrow)
+library(sfarrow)
+library(dplyr)
+library(lubridate)
+library(microdatasus)
+library(geobr)
+library(sf)
+
+df_bronze <- read_parquet("data/bronze/AQ_SP_2019.parquet")
+```
+
+---
+
+# 1. Filtros e seleção de variáveis
+
+Mantendo apenas o que é necessário para a análise.
+```{r}
+df <- df_bronze %>% 
+  select(
+    AP_CMP, AP_MVM, AP_CIDPRI, AP_NUIDADE, AP_SEXO,
+    AP_UFMUN, AP_MUNPCN, AP_TPUPS, AP_OBITO,
+    AQ_ESTADI, AQ_ESQU_P1, AQ_ESQU_P2, AP_CNSPCN,
+    AP_DTINIC, AP_DTFIM, AP_TPAPAC, AP_MOTSAI
+  ) %>% 
+  filter(grepl("^C50", AP_CIDPRI)) %>% 
+  filter(AP_SEXO == "F")
+ 
+cat("Registros C50 femininos:", nrow(df), "\n")
+```
+
+# 2. Tratamento de encoding e missings disfarçados
+Geralmente no DATASUS há campos com valores que podem representar NAs: "0000", "00", "99", "00000000".
+
+Além disso precisamos converter/remover caracteres inválidos do latin1 "iconv(variável, from = "latin1", to = "UTF-8", sub = "")".
+
+Também é necessário Transformar variáveis para tipos adequados: idade numérica, datas como Date, óbito como flags booleana.
+
+```{r}
+df <- df %>% 
+  mutate(
+    AQ_ESQU_P1 = iconv(AQ_ESQU_P1, from = "latin1", to = "UTF-8", sub = ""),
+    AQ_ESQU_P2 = iconv(AQ_ESQU_P2, from = "latin1", to = "UTF-8", sub = ""),
+    AQ_ESTADI = ifelse(AQ_ESTADI %in% c("0", "00", "9", "99"), NA, AQ_ESTADI),
+    AP_MUNPCN = ifelse(AP_MUNPCN %in% c("000000", "999999"), NA, AP_MUNPCN),
+    AP_UFMUN  = ifelse(AP_UFMUN  %in% c("000000", "999999"), NA, AP_UFMUN),
+    idade = as.integer(AP_NUIDADE),
+    idade = ifelse(idade < 18 | idade > 110, NA, idade),
+    dt_inicio = ymd(AP_DTINIC),
+    dt_fim    = ymd(AP_DTFIM),
+    competencia = ym(AP_CMP),
+    obito = AP_OBITO == "1"
+  )
+   
+```
+obs: A competência representa o mês de processamento da APAC no sistema do SUS, sendo utilizada como proxy temporal da ocorrência do tratamento.
+---
+
+# 3. Padronização do estadiamento
+
+AQ_ESTADI pode vir em formatos inconsistentes: "1", "I", "01", "II", "4", "IV".
+Padronizamos para escala numérica 1-4.
+```{r}
+summary(as.factor(df$AQ_ESTADI))
+```
+
+já estão no formato numérico (1, 2, 3, 4) e não possuem as strings complexas (como "01" ou "II").
+Realizar conversão direta de tipo
+```{r}
+df <- df %>% 
+  mutate(estadiamento = as.integer(AQ_ESTADI))
+
+```
+
+conferir distribuição após padronização
+```{r}
+df %>%  count(estadiamento, useNA = "always")
+```
+---
+
+# 4. Identificação dos grupos
+Grupo exposto: trajetória terapêutica de quimioterapia + trastuzumabe (regex validado na Bronze).
+Grupo controle: trajetória terapêutica de  quimioterapia sem anti-HER2 registrado.
+```{r}
+df <- df %>% 
+  mutate(
+    esquema = paste0(AQ_ESQU_P1, " ", AQ_ESQU_P2),
+    grupo = case_when(
+      grepl("HERCE|TRAST", esquema, ignore.case = TRUE) ~ "trast",
+      TRUE ~ "quimio"
+    ),
+    grupo = factor(grupo, levels = c("quimio", "trast"))
+  )
+```
+
+conferindo o n dos grupos
+```{r}
+df %>%  count(grupo)
+```
+
+---
+
+# 5. Tipo de estabelecimento
+
+AP_TPUPS identifica se o paciente foi tratado em CACON (centro de alta complexidade) ou UNACON (unidade de assistência). 
+poteriormente será usada como covariável de acesso.
+
+```{r}
+df <- df %>% 
+  mutate(
+    tipo_serv = case_when(
+      AP_TPUPS == "05" ~ "CACON",
+      AP_TPUPS == "07" ~ "UNACON",
+      TRUE ~ "outro"
+    )
+  )
+```
+
+
+```{r}
+df %>%  count(tipo_serv, grupo)
+```
+
+---
+
+# 6. Ingestão SIM — Sistema de Mortalidade
+
+O linkage SIA × SIM é o principal desafio.
+Como discutido no enunciado do desafio o DATASUS público é desidentificado. Portanto, segui a proposta de um linkage probabilístico.
+
+**linkage probabilístico:**
+sexo + faixa etária (±2 anos) + município de residência + CID (C50.x) + mês/ano próximo ao último registro de APAC.
+
+Pacientes não linkados são tratados como censurados.
+
+## 6.1 download SIM — declarações de óbito SP 2019
+```{r}
+sim_sp <- fetch_datasus(
+  year_start = 2019, month_start = 1,
+  year_end   = 2019, month_end   = 12,
+  uf = "SP",
+  information_system = "SIM-DO"
+)
+
+write_parquet(sim_sp, "data/bronze/SIM_SP_2019.parquet")
+```
+
+n de óbitos registrados no SIM para SP em 2019
+```{r}
+cat("Óbitos registrados SP 2019:", nrow(sim_sp), "\n")
+```
+
+
+# 6.2 preparar SIM para linkage 
+obs: idade é str com 4 digitos (o primeiro digito = o tipo da idade[4=anos, 3=meses, 2 =dias]). Portanto, filtro apenas "4" → anos.
+```{r}
+sim_mama <- sim_sp %>% 
+  filter(grepl("^C50", CAUSABAS)) %>% 
+  mutate(
+    sexo_sim   = SEXO,
+    idade_tipo = substr(IDADE, 1, 1),
+    idade_sim  = as.integer(substr(IDADE, 2, 4)),
+    idade_sim  = ifelse(idade_tipo == "4", idade_sim, NA_integer_),
+    munres_sim = CODMUNRES,
+    dt_obito   = dmy(DTOBITO),
+    cid_sim    = CAUSABAS
+  ) %>% 
+  select(sexo_sim, idade_sim, munres_sim, dt_obito, cid_sim)
+
+```
+
+conferindo  linhas (sexo feminino = 2)
+```{r}
+cat("Óbitos C50 femininos SP 2019:", nrow(sim_mama %>%  filter(sexo_sim == "2")), "\n")
+```
+
+# 6.3 linkage probabilístico por variáveis proxy
+lógica: paciente do SIA pode ser ligado a óbito do SIM se:
+
+- mesmo município de residência
+
+- mesma faixa etária (±2 anos)
+
+- CID C50 no SIM
+
+- data do óbito dentro de 6 meses após última APAC
+
+
+última APAC por paciente
+ultima_comp como Date para comparação consistente com dt_obito
+ 
+```{r}
+ultima_apac <- df %>% 
+  group_by(AP_CNSPCN) %>% 
+  summarise(
+    ultima_comp = as.Date(max(competencia, na.rm = TRUE)),
+    idade       = first(idade),
+    munres      = first(AP_MUNPCN),
+    .groups     = "drop"
+  )
+```
+
+linkage — join aproximado por município + faixa etária
+```{r}
+obitos_linkados <- ultima_apac %>% 
+  inner_join(
+    sim_mama %>% filter(sexo_sim == "2", grepl("^C50", cid_sim)), 
+    by = join_by(munres == munres_sim),
+    relationship = "many-to-many"
+  ) %>% 
+  filter(!is.na(idade), !is.na(idade_sim), !is.na(dt_obito)) %>% 
+  filter(abs(idade - idade_sim) <= 2) %>% 
+  filter(dt_obito >= ultima_comp,
+         dt_obito <= ultima_comp + months(6)) %>% 
+  mutate(diff_tempo = as.numeric(dt_obito - ultima_comp)) %>% 
+  group_by(AP_CNSPCN) %>% 
+  slice_min(diff_tempo, n = 1, with_ties = FALSE) %>% 
+  ungroup()
+
+```
+```{r}
+cat("Óbitos linkados (proxy):", nrow(obitos_linkados), "\n")
+cat("Taxa de linkage:", round(nrow(obitos_linkados) / nrow(ultima_apac) * 100, 1), "%\n")
+```
+(~46% de linkage) NÃO está plausível epidemiologicamente
+
+
+Nova tentativa com linkage mais sensível:
+
+- Diff tempo de 1 mês
+
+- diferença de idade de 1 ano
+
+- filtro de plausibilidade
+
+- não forçar match para todos
+
+- manter melhor match somente quando válido
+
+# Janela real de linkage: 30 dias após última APAC
+# Limitação: janela curta aumenta sensibilidade mas reduz recall.
+# Óbitos tardios (>30 dias após última APAC) ficam de fora.
+filter(dt_obito >= ultima_comp,
+       dt_obito <= ultima_comp + days(30)) %>%
+mutate(diff_tempo = as.numeric(dt_obito - ultima_com
+
+
+```{r}
+obitos_linkados <- ultima_apac %>% 
+  inner_join(
+    sim_mama %>% filter(sexo_sim == "2", grepl("^C50", cid_sim)),
+    by = join_by(munres == munres_sim),
+    relationship = "many-to-many"
+  ) %>% 
+  filter(abs(idade - idade_sim) <= 1) %>% 
+  filter(dt_obito >= ultima_comp,
+         dt_obito <= ultima_comp + days(30)) %>% 
+  mutate(diff_tempo = as.numeric(dt_obito - ultima_comp)) %>% 
+  group_by(AP_CNSPCN) %>% 
+  slice_min(diff_tempo, n = 1, with_ties = FALSE) %>% 
+  ungroup()
+
+```
+
+
+```{r}
+cat("Óbitos linkados (proxy):", nrow(obitos_linkados), "\n")
+cat("Taxa de linkage:", round(nrow(obitos_linkados) / nrow(ultima_apac) * 100, 1), "%\n")
+```
+Mesmo com a estratégia mais restritiva o linkage não convergiu de acordo com as probabilidades esperadas.
+Possivelmente em decorrência do tamanho dos municípios de SP.
+
+Com base nisso, o linkage não será utilizado na análise de sobrevida.
+O foco será somente em Time to Treatment Discontinuation.
+
+---
+
+# 7. Enriquecimento com variável de deslocamento intermunicipal
+
+```{r}
+df <- df %>% 
+  mutate(
+    deslocamento = ifelse(
+  !is.na(AP_MUNPCN) & !is.na(AP_UFMUN) &
+  AP_MUNPCN != AP_UFMUN, 1, 0))
+```
+
+
+
+
+---
+
+# 8. Dados geoprocessamento - Calcular centroide de cada município 
+lendo o arquivo
+```{r}
+municipios_sp <- st_read_parquet("data/bronze/municipios.parquet")
+```
+
+
+- (suppressWarnings pois crs projetado pode gerar warning de CRS esférico)
+
+- IBGE usa 7 dígitos; SIA usa 6 (sem o último dígito verificador)
+
+
+```{r}
+centroides <- suppressWarnings(
+  municipios_sp %>%
+    mutate(centroide = st_centroid(geom)) %>%
+    mutate(
+      lon = st_coordinates(centroide)[, 1],
+      lat = st_coordinates(centroide)[, 2],
+      cod_6 = substr(as.character(code_muni), 1, 6)
+    ) %>%
+    select(cod_6, name_muni, lon, lat) %>%
+    st_drop_geometry()
+)
+
+cat("Municípios SP com centroide:", nrow(centroides), "\n")
+```
+
+
+---
+
+# 9. Salvar Silver
+salvando dataset silver
+
+```{r}
+glimpse(df)
+```
+```{r}
+write_parquet(df, "data/silver/SIA_silver_SP_2019.parquet")
+
+```
+
+```{r}
+write_parquet(centroides, "data/silver/centroides.parquet")
+```
+
+

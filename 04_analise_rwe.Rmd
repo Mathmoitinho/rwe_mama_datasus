@@ -1,0 +1,360 @@
+---
+title: "RWE Câncer de Mama — Trajetórias terapêuticas no SUS"
+output: html_notebook
+data: "2026-04-12"
+#Notebook Análises
+---
+
+```{r}
+library(arrow)       
+library(dplyr)       
+library(ggplot2)     
+library(survival)    
+library(survminer)
+library(gtsummary)   # Fromatação de Tabelas
+library(smd)         # Cálculo automático de diferença nas tabelas
+library(WeightIt)    # IPTW
+library(cobalt)      # Love Plot
+library(broom)       # tidy() para coeficientes Cox
+library(scales)      # Formatação de eixos
+
+
+df_surv <- read_parquet("data/gold/SIA_gold_SP_2019.parquet")
+
+glimpse(df_surv)
+```
+
+---
+
+# 1. Análise Descritiva da Coorte
+
+Visão Geral das variáveis 
+```{r}
+qqnorm(df_surv$idade)
+qqline(df_surv$idade, col = 2)
+qqnorm(df_surv$tempo_evento)
+qqline(df_surv$tempo_evento, col = 2)
+```
+
+* Verificando desbalanceamento das variáveis
+
+tabela descritiva de idade e tempo de evento discriminada entre exposição
+```{r}
+tabela1 <- df_surv %>%
+  select(tempo_evento, idade, exposicao) %>% 
+  tbl_summary(
+    by = exposicao,
+    statistic = list(
+      idade ~ "{mean} ({sd})",
+      tempo_evento ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = list(
+      idade ~ 1,
+      tempo_evento ~ 0
+    )
+  ) %>%
+  add_difference() %>%     
+  add_overall() %>%        
+  bold_labels()
+tabela1
+```
+
+
+
+- Distribuição da Idade por Grupo
+```{r}
+ggplot(df_surv, aes(x = idade, fill = exposicao, color = exposicao)) +
+  geom_density(alpha = 0.35, linewidth = 0.9) +
+  geom_vline(
+    data = df_surv %>% group_by(exposicao) %>% summarise(mean = mean(idade,na.rm=TRUE)),
+    aes(xintercept = mean, color = exposicao),
+    linetype = "dashed", linewidth = 0.8
+  ) +
+  scale_fill_manual(values  = c("Quimio isolada" = "#6c757d",
+                                 "Quimio + Trastuzumabe" = "#c0392b"),
+                    name = "Group") +
+  scale_color_manual(values = c("Quimio isolada" = "#6c757d",
+                                 "Quimio + Trastuzumabe" = "#c0392b"),
+                     name = "Group") +
+  labs(
+    title    = "Age Distribution by Exposure Group",
+    subtitle = "Dashed lines indicate the Mean of each group",
+    x        = "Age (years)",
+    y        = "Density",
+    caption  = "Fonte: DATASUS/SIA-SUS, SP, 2019."
+  )
+```
+
+
+- Distribuição do tempo até o evento por Grupo
+```{r}
+ggplot(df_surv, aes(x = tempo_evento, fill = exposicao, color = exposicao)) +
+  geom_density(alpha = 0.35, linewidth = 0.9) +
+  geom_vline(
+    data = df_surv %>% group_by(exposicao) %>% summarise(med = median(tempo_evento, na.rm=TRUE)),
+    aes(xintercept = med, color = exposicao),
+    linetype = "dashed", linewidth = 0.8
+  ) +
+  scale_fill_manual(values  = c("Quimio isolada" = "#6c757d",
+                                 "Quimio + Trastuzumabe" = "#c0392b"),
+                    name = "Group") +
+  scale_color_manual(values = c("Quimio isolada" = "#6c757d",
+                                 "Quimio + Trastuzumabe" = "#c0392b"),
+                     name = "Group") +
+  labs(
+    title    = "Time-to-Event Distribution by Exposure Group",
+    subtitle = "Dashed lines indicate the median of each group",
+    x        = "Time to event (Days)",
+    y        = "Density",
+    caption  = "Fonte: DATASUS/SIA-SUS, SP, 2019."
+  )
+
+```
+
+
+
+* Análise descritiva das demais variáveis
+```{r}
+tabela2 <- df_surv %>%
+  select(evento, estadiamento, tipo_serv, deslocamento, exposicao) %>% 
+  tbl_summary(
+    by = exposicao,
+    statistic = list(
+      all_categorical() ~ "{n} ({p}%)"
+    )
+  ) %>%
+  add_overall() %>%        
+  bold_labels()
+tabela2
+```
+
+
+# 2. Inferência Causal: Balanceamento via IPTW
+
+- Estimação dos pesos via WeightIt (IPTW com regressão logística) 
+
+```{r}
+# Voltando para binário
+df_surv_w <- df_surv %>%
+  mutate(
+    trat_bin = as.integer(exposicao == "Quimio + Trastuzumabe"),
+    evento = as.integer(evento == "Descontinuação")
+  )
+
+set.seed(123)
+iptw_fit <- weightit(
+  trat_bin ~ idade + estadiamento + tipo_serv + deslocamento,
+  data   = df_surv_w,
+  method = "ps",          
+  estimand = "ATE"        
+)
+
+summary(iptw_fit)
+```
+Detecção de pesos extremos Max treated weight: 73.5, indicando que alguns indivíduos têm uma probabilidade muito baixa de pertencer ao grupo oposto, o que pode gerar instabilidade do modelo 
+
+* avaliação dos pesos por love.plot
+```{r}
+love.plot(
+  iptw_fit,
+  thresholds  = c(m = 0.1),   # Limiar de aceitação SMD < 0.1
+  binary      = "std",
+  abs         = TRUE,
+  var.order   = "unadjusted",
+  colors      = c("Não Ajustado" = "#c0392b", "Ajustado (IPTW)" = "#27ae60"),
+  shapes      = c("Não Ajustado" = "circle", "Ajustado (IPTW)" = "square"),
+  title       = "Love Plot — Balanceamento de Covariáveis Antes e Após IPTW",
+  subtitle    = "Threshold: SMD < 0.10 (linha vermelha tracejada)",
+  sample.names = c("Não Ajustado", "Ajustado (IPTW)"),
+  position    = "right"
+) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+
+A presença de pesos extremos sugere a necessidade de considerar técnicas de estabilização ou truncamento dos pesos para melhorar a robustez das estimativas (TRIMMING / TRUNCATION).
+
+
+- Realizando Trimming dos pesos para reduzir o impacto de valores extremos (cortando os pesos acima do percentil 99.5)
+```{r}
+pesos <- get.w(iptw_fit)
+
+pesos_trim <- pmin(pesos, quantile(pesos, 0.995))
+```
+
+* Reavaliando o balanceamento após o trimming
+```{r}
+love.plot(
+  iptw_fit,
+  weights      = list(Trimmed = pesos_trim),
+  thresholds   = c(m = 0.1),
+  abs          = TRUE,
+  var.order    = "unadjusted",
+  sample.names = c("Original", "IPTW Full", "Ajustado (Trimmed)"),
+  stats        = "m",
+  which.weights = c("Original", "Trimmed"), 
+  colors       = c("#c0392b", "#27ae60"),
+  title        = "Love Plot — Balanceamento Após Trimming"
+) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+```
+Adicionando os pesos ao dataframe
+```{r}
+df_surv_w$pesos_trim <- pesos_trim
+```
+
+Comparando o balanço com os pesos cortados
+```{r}
+bal.tab(iptw_fit, weights = pesos_trim, un = TRUE, thresholds = c(m = .1))
+```
+# 3. Kaplan-Meier (KM) Ponderado por IPTW
+
+
+KM ponderado
+```{r}
+km_ponderado <- survfit(
+  Surv(tempo_evento, evento) ~ trat_bin,
+  data    = df_surv_w,
+  weights = pesos_trim
+)
+```
+
+Log-Rank Test ponderado (para significância estatística)
+```{r}
+cox_w <- coxph(
+  Surv(tempo_evento, evento) ~ trat_bin,
+  data = df_surv_w,
+  weights = pesos_trim,
+  robust = TRUE
+)
+
+summary(cox_w)
+
+pval <- summary(cox_w)$coefficients[,"Pr(>|z|)"]
+
+pval_formatado <- ifelse(
+  pval < 0.001,
+  "p < 0.001",
+  paste0("p = ", round(pval, 3))
+)
+```
+
+Plotando KM
+```{r}
+km_plot <- ggsurvplot(
+  km_ponderado,
+  data = df_surv_w,
+  risk.table = TRUE,
+  conf.int = FALSE,
+   axes.offset = TRUE, 
+  ylim = c(0.80, 1.01), 
+  censor = FALSE,#FALSE somente para avaliar proporcionalidade no tempo sem o ruído das censuras
+  legend = "none",
+  xlab = "Tempo (dias)",
+  ylab = "Manutenção do tratamento",
+  title = "Kaplan-Meier ponderado por IPTW",
+  ggtheme = theme_minimal(base_size = 09),
+  risk.table.height = 0.4
+)
+km_plot$plot <- km_plot$plot +
+  scale_color_manual(values = c("#6c757d", "#c0392b"))
+km_plot$plot <- km_plot$plot +
+  annotate(
+    "text",
+    x = 300, # Posição fixa no tempo para evitar erros
+    y = 0.82,
+    label = pval_formatado,
+    size = 4.5,
+    fontface = "bold"
+  )
+
+print(km_plot)
+
+```
+
+
+
+# 4. Regressão de Cox
+- Modelo Cox não ponderado (para teste de Schoenfeld)
+
+```{r}
+cox_pressuposto <- coxph(
+  Surv(tempo_evento, evento) ~ trat_bin + idade + estadiamento + tipo_serv + deslocamento,
+  data = df_surv_w
+)
+
+schoenfeld_test <- cox.zph(cox_pressuposto)
+
+print(schoenfeld_test)
+```
+deslocamento (p = 0.0127): É a violação mais grave. O efeito de morar longe ou perto do serviço de saúde muda significativamente ao longo do tempo de acompanhamento.
+
+* Gráfico dos resíduos de Schoenfeld
+```{r}
+par(mfrow = c(2, 3), mar = c(4, 4, 3, 1))
+plot(schoenfeld_test,
+     col   = "#c0392b",
+     lwd   = 1.5,
+     main  = "Resíduos de Schoenfeld")
+par(mfrow = c(1, 1))
+
+```
+
+- Embora variáveis de ajuste (idade e deslocamento) tenham apresentado desvios marginais da proporcionalidade pelo Teste de Schoenfeld, a variável primária de exposição cumpriu o pressuposto, mantendo a validade da estimativa principal.
+
+
+- Uma abordagem estatística mais rigorosa envolveria a introdução de um termo de interação entre as variáveis que violaram o pressuposto (idade e deslocamento) e uma função do tempo, para acomodar a não-proporcionalidade dos riscos e resolver o problema de forma sistêmica. Entretanto, a introdução de termos de interação no ajuste duplamente robusto adicionaria complexidade desnecessária à interpretação clínica sem ganho substancial na validade da estimativa principal. Em vista disso, optei por não realizar essa modificação e realizar apenas o modelo de Cox Duplamento Robusto. 
+
+
+Modelo Cox Ponderado e Duplamente Robusto
+```{r}
+cox_w_robust <- coxph(
+  Surv(tempo_evento, evento) ~ trat_bin + idade + estadiamento + tipo_serv + deslocamento,
+  data = df_surv_w,
+  weights = pesos_trim,
+  robust = TRUE
+)
+
+summary(cox_w_robust)
+```
+
+Extraindo os resultados específicos do tratamento
+```{r}
+tabela_base <- tbl_regression(
+  cox_w_robust, 
+  exponentiate = TRUE,
+  label = list(
+    trat_bin ~ "Tratamento",
+    idade ~ "Idade",
+    estadiamento ~ "Estadiamento",
+    tipo_serv ~ "Tipo de Serviço",
+    deslocamento ~ "Deslocamento"
+  )
+)
+ 
+tabela_base
+
+
+```
+O Efeito do Tratamento ajustado: O  HR caiu um pouquinho de 1.54 para 1.48 (IC 95%: 1.16 - 1.88). 
+Ou seja, com a amostra balanceada e com o modelo controlando os resíduos, o grupo Trastuzumabe tem 48% a mais de risco de descontinuar do que a quimio isolada.
+
+O coeficiente da variável tipo_servCACON é de 0.65 (p = 0.002). 
+Significa que pacientes tratados em Centros de Alta Complexidade têm 35% menos risco de descontinuar o tratamento do que aqueles em UNACONs.
+
+O Deslocamento Intermunicipal tem uma tendência a ser protetor também (HR = 0.77, p = 0.067). Com isso surge a dúvida se o deslocamento é um proxy de acesso a serviços de maior complexidade (CACON) ou se o deslocamento em si tem um efeito protetor, talvez por uma questão de engajamento do paciente.
+
+Esta hipótese compõe a fase de Aprofundamento por Geoprocessamento/Acesso (opção B).
+
+No README estes resultados são discutidos amplamente. 
+
+# 5. Salvando parquet
+
+```{r}
+write_parquet(df_surv_w, "Aprofundamento/df_aprofundamento.parquet")
+
+```

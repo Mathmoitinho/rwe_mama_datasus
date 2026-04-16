@@ -1,0 +1,128 @@
+---
+title: "RWE Câncer de Mama — Trajetórias terapêuticas no SUS"
+output: html_notebook
+data: "2026-04-12"
+#Camada Bronze
+---
+
+# 1. Ingestão 
+
+Download do SIA-AQ para SP, ano completo de 2019. Os dados são salvos em formato
+parquet sem nenhum tratamento 
+
+```{r}
+library(arrow)
+library(sfarrow)
+
+df_bronze <- fetch_datasus(
+  year_start = 2019, month_start = 1,
+  year_end   = 2019, month_end   = 12,
+  uf = "SP",
+  information_system = "SIA-AQ"
+)
+
+```
+
+visualização do df bruto:
+```{r}
+glimpse(df_bronze)
+```
+
+seleção das Variáveis relevantes para o estudo:
+
+| AP_CMP = Competência (AAAAMM) — define T0
+| AP_MVM = Validade da APAC — base do TTD
+| AP_CIDPRI = CID principal — filtro C50.x
+| AP_NUIDADE = Idade
+| AP_SEXO = Sexo
+| AP_UFMUN = Município do estabelecimento
+| AP_MUNPCN = Município de residência
+| AP_TPUPS = Tipo de serviço (05=CACON, 07=UNACON)
+| AP_OBITO = Óbito registrado na APAC
+| AQ_ESTADI = Estadiamento — 12.7% missing
+| AQ_ESQU_P1 = Esquema quimio parte 1 (texto livre) *
+| AQ_ESQU_P2 = Esquema quimio parte 2 — 21.7% missing *
+| AP_CNSPCN = CNS hasheado — identificador proxy do paciente
+
+
+- Os campos de texto no SIA/SUS são herdados de sistemas legados que usam larguras fixas de coluna, podendo um texto com mais de 10 caracteres ocupar duas caselas (AQ_ESQU_P1+AQ_ESQU_P2)
+
+---
+
+## 2 avaliando NAs dos campos críticos
+
+```{r}
+df_bronze  %>% 
+  select(AP_CMP, AP_MVM, AP_CIDPRI, AP_NUIDADE, AP_SEXO,
+         AP_UFMUN, AP_MUNPCN, AP_TPUPS, AP_OBITO,
+         AQ_ESTADI, AQ_ESQU_P1, AQ_ESQU_P2, AP_CNSPCN) %>% 
+  summarise(across(everything(), ~round(mean(is.na(.)) * 100, 1))) %>% 
+  tidyr::pivot_longer(everything(),
+                      names_to = "variavel",
+                      values_to = "pct_missing")
+
+```
+
+O missing em AQ_ESQU_P2 é relevante: parte dos registros com trastuzumabe pode
+estar sendo perdida se o nome caiu inteiro no P1 ou se o preenchimento ficou
+incompleto. Tende a subestimar o grupo exposto — declarado como limitação.
+
+---
+
+## 3 Validação do grupo exposto
+
+```{r}
+df_bronze %>% 
+  filter(grepl("^C50", AP_CIDPRI)) %>% 
+  mutate(esquema = paste(AQ_ESQU_P1, AQ_ESQU_P2)) %>% 
+  mutate(trast = grepl("HERCE|TRAST", esquema, ignore.case = TRUE)) %>% 
+  count(trast)
+
+```
+
+O aviso unable to translate '<bf>TX NA'... indica um erro de codificação 
+Ajuste para este erro "esquema = iconv(esquema, from = "latin1", to = "UTF-8", sub = ""),"
+
+```{r}
+df_bronze %>% 
+  filter(grepl("^C50", AP_CIDPRI)) %>% 
+  mutate(
+    esquema = paste0(AQ_ESQU_P1, AQ_ESQU_P2),
+    esquema = iconv(esquema, from = "latin1", to = "UTF-8", sub = ""),
+    trast   = grepl("HERCE|TRAST", esquema, ignore.case = TRUE)
+  ) %>% 
+  count(trast)
+
+```
+
+
+---
+
+# 4. Salvar bonze
+salvando dataset bonze
+
+```{r}
+glimpse(df_bronze)
+```
+
+
+
+ Baixar geometria dos municípios de SP via geobr
+
+- geobr retorna sf com código IBGE (code_muni = 7 dígitos)
+
+```{r}
+municipios_sp <- read_municipality(code_muni = "SP", year = 2019)
+```
+
+
+
+```{r}
+write_parquet(df_bronze, "data/bronze/AQ_SP_2019.parquet")
+```
+
+
+```{r}
+st_write_parquet(municipios_sp, "data/bronze/municipios.parquet")
+```
+

@@ -1,0 +1,55 @@
+---
+title: "RWE Câncer de Mama — Trajetórias terapêuticas no SUS"
+output: html_notebook
+data: "2026-04-12"
+#setup
+---
+
+# Contexto
+
+Coorte retrospectiva usando SIA-AQ/DATASUS para avaliar diferenças na persistência ao tratamento (TTD) entre trajetórias terapêuticas observadas no SUS-SP.
+
+O cerne da análise é a comparação entre trajetórias terapêuticas observadas na prática clínica do SUS, reconhecendo que essas trajetórias refletem tanto decisões terapêuticas quanto características biológicas subjacentes não observadas nos dados administrativos.
+
+Importante: essas trajetórias estão intrinsecamente associadas a subtipos  moleculares diferentes (HER2+ vs. outros), informação não disponível em dados administrativos. 
+O IPTW será utilizado para mitigar o confundimento. 
+Tais apontamentos são discutidos no README e devem ser considerados na interpretação dos resultados.
+
+OBS: As diferenças no TTD devem ser interpretadas como reflexo de trajetórias de cuidado no SUS.
+
+## PECO
+**P** Mulheres ≥18 anos, CID C50.x, SP, 2019, new user design |
+**E** Quimioterapia + trastuzumabe (regex `HERCE\|TRAST` em AQ_ESQU_P1/P2) |
+**C** Quimioterapia isolada, sem anti-HER2 registrado |
+**O** TTD — tempo até gap >90 dias entre APACs ou flag de óbito |
+
+## Observações metodológicas
+- Uso de TTD como proxy de efetividade (limitação de óbito no DATASUS)
+- Identificação de trastuzumabe via texto livre (AQ_ESQU_P1/P2)
+- Restrição a 2019 para evitar viés COVID e mudanças de acesso
+- Uso de IPTW para controle de confundimento observável
+
+---
+# 1. bibliotecas necessárias
+
+```{r}
+
+library(dplyr)
+library(arrow)
+
+# dados DATASUS
+if (!require(remotes))   install.packages("remotes")
+if (!require(microdatasus))
+  remotes::install_github("rfsaldanha/microdatasus")
+library(microdatasus)
+
+```
+criação dos diretórios
+```{r}
+dirs <- c("data/bronze", "data/silver",
+          "data/gold", "Aprofundamento")
+for (d in dirs) dir.create(d, recursive = TRUE,
+                            showWarnings = FALSE)
+```
+
+# Ir para 01_bronze

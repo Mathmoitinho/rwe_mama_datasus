@@ -1,0 +1,274 @@
+---
+title: "RWE Câncer de Mama — Trajetórias terapêuticas no SUS"
+output: html_notebook
+data: "2026-04-12"
+#Camada ouro
+---
+
+Carregando anterior
+
+```{r}
+library(arrow)
+library(dplyr)
+
+df <- read_parquet("data/silver/SIA_silver_SP_2019.parquet")
+centroides <- read_parquet("data/silver/centroides.parquet")
+
+```
+---
+
+# 1. construção da coorte analítica - criando o df_final 
+
+
+- eliminando usuários prevalentes (filtrar apenas pacientes cuja primeira dt_inicio seja em 2019.)
+
+- (long) cada linha = uma APAC e cada paciente = várias linhas
+
+- gap > 90 dias → descontinuação (quando o intervalo até a próxima competência excede 90 dias. O evento é marcado na linha atual que precede o hiato, utilizando case_when para garantir que o último registro seja tratado como censura (0L).
+
+- lag competencia como dias
+
+- criando exposição binária com Intention-to-Treat.Definindo exposição pela presença da terapia-alvo nas 3 primeiras competências (90 dias) | Mitigando Immortal Time Bias.
+
+- Time Zero: Calculado a partir da primeira data de início de tratamento (dt_inicio), e não da competência de faturamento. limpando o ruído do calendário administrativo do SUS.
+ 
+
+
+```{r}
+df_final <- df %>% 
+  filter(idade >= 18) %>% 
+  arrange(AP_CNSPCN, competencia) %>% 
+  group_by(AP_CNSPCN) %>% 
+  filter(first(dt_inicio) >= as.Date("2019-01-01")) %>% 
+  mutate(
+    esquema = paste(AQ_ESQU_P1, AQ_ESQU_P2),
+    exposicao_linha = ifelse(grepl("HERCE|TRAST", esquema, ignore.case = TRUE), 1, 0),
+    exposicao = ifelse(any(head(exposicao_linha, n = 3) == 1), 1, 0),
+    gap = as.numeric(difftime(lead(competencia), competencia, units = "days")),
+    evento_ttd = case_when(!is.na(gap) & gap > 90 ~ 1L, TRUE ~ 0L),
+    tempo = as.numeric(difftime(competencia, min(dt_inicio, na.rm = TRUE), units = "days"))
+    ) %>% 
+  ungroup() %>% 
+  rename(
+    id_paciente = AP_CNSPCN,
+    municipio_residencia = AP_MUNPCN,
+    idade_anos = idade,
+    data_competencia = competencia
+  )
+```
+ 
+
+visualizando
+```{r}
+glimpse(df_final)
+```
+
+ 
+ Checar estrutura longitudinal
+```{r}
+df_final %>%
+  count(id_paciente) %>%
+  summarise(min_n = min(n), max_n = max(n))
+```
+Filtro para garantir que os pacientes tenham trajetória (pelo menos 2 APACs)
+
+```{r}
+df_final <- df_final %>%
+  group_by(id_paciente) %>%
+  filter(n() > 1) %>%
+  ungroup()
+```
+ 
+
+---
+
+# 2. criando o df para sobrevida
+
+* Censura
+
+- Pacientes sem evento foram censurados na última observação disponível no SIA (Última APAC registrada)
+
+* Covariaveis
+
+- Idade
+
+- Estadiamento
+
+- Tipo de Serviço utilizado
+
+- Deslocamento intermunicipal
+
+```{r}
+df_surv <- df_final %>% 
+  group_by(id_paciente) %>% 
+  summarise(
+    tempo_evento = ifelse(
+      any(evento_ttd == 1, na.rm = TRUE),
+      min(tempo[evento_ttd == 1], na.rm = TRUE),
+      max(tempo, na.rm = TRUE)
+    ),
+    evento = ifelse(any(evento_ttd == 1, na.rm = TRUE), 1, 0),
+    exposicao = first(exposicao),
+    idade = first(idade_anos),
+    estadiamento = first(estadiamento),
+    tipo_serv = as.factor(first(tipo_serv)),
+    deslocamento = first(deslocamento),
+    .groups = "drop"
+  )
+
+```
+
+```{r}
+glimpse(df_surv)
+```
+é normal reduzir tanto as linhas após o filtro e sumarização, pois cada paciente agora tem apenas uma linha representando seu tempo até o evento ou censura, ao invés de múltiplas linhas para cada APAC.
+
+ajustando os formatos dos dados
+```{r}
+df_surv <- df_surv %>%
+  mutate(
+    exposicao     = factor(exposicao, levels = c(0, 1),
+                           labels = c("Quimio isolada", "Quimio + Trastuzumabe")),
+    estadiamento  = factor(estadiamento),
+    tipo_serv     = factor(tipo_serv),
+    deslocamento  = factor(deslocamento, levels = c(0, 1),
+                           labels = c("Mesmo município", "Intermunicipal")),
+     evento = factor(evento, labels = c("Censurado", "Descontinuação"))
+  )
+```
+
+---
+
+# 3. verificações finais e ajustes
+
+
+checagens 
+```{r}
+summary(df_surv)
+```
+tempo de evento -28 detectado
+```{r}
+df_surv <- df_surv %>%
+  filter(tempo_evento > 0)
+
+```
+
+ 
+```{r}
+table(df_surv$evento)
+table(df_surv$exposicao)
+```
+
+
+---
+
+# 4. Filtrar fluxos relevantes para o mapa do geoprocessamento
+
+Filtro de:
+
+- pacientes que SE DESLOCARAM (munres ≠ mun_estabelecimento)
+
+- foram tratadas em CACON (alta complexidade)
+
+- Cada linha = uma APAC = um "viagem" de origem→destino
+
+
+```{r}
+fluxos_raw <- df %>%
+  filter(
+    tipo_serv == "CACON",             
+    deslocamento == 1,                
+    !is.na(AP_MUNPCN),               
+    !is.na(AP_UFMUN)                 
+  ) %>%
+  select(
+    mun_origem  = AP_MUNPCN,         
+    mun_destino = AP_UFMUN,
+    grupo
+  ) %>%
+  # Código SUS tem 6 dígitos, IBGE também — confirmar se são iguais... se não, truncar:
+  mutate(
+    mun_origem  = substr(as.character(mun_origem),  1, 6),
+    mun_destino = substr(as.character(mun_destino), 1, 6)
+  )
+
+cat("Fluxos CACON com deslocamento:", nrow(fluxos_raw), "\n")
+```
+
+Agregar por par origem–destino
+
+- Em vez de uma linha por APAC (muito ruído), agregar o volume de pacientes
+
+- únicas por par (origem, destino). O n será o peso visual da linha.
+
+- Filtrar pares com pelo menos 5 APACs para reduzir ruído visual
+
+```{r}
+fluxos_agg <- fluxos_raw %>%
+  group_by(mun_origem, mun_destino) %>%
+  summarise(n_apacs = n(), .groups = "drop") %>%
+  filter(n_apacs >= 5) %>%
+  arrange(desc(n_apacs))
+
+cat("Pares origem-destino (≥5 APACs):", nrow(fluxos_agg), "\n")
+head(fluxos_agg, 10)
+```
+---
+
+# 5. Associar coordenadas a cada par origem–destino
+
+Remover pares sem match geográfico (municípios fora de SP ou código inválido)
+
+Checar municípios de destino mais comuns (os grandes polos de CACON)
+
+```{r}
+fluxos_geo <- fluxos_agg %>%
+  left_join(centroides, by = c("mun_origem" = "cod_6")) %>%
+  rename(lon_orig = lon, lat_orig = lat, nome_orig = name_muni) %>%
+  left_join(centroides, by = c("mun_destino" = "cod_6")) %>%
+  rename(lon_dest = lon, lat_dest = lat, nome_dest = name_muni)
+
+fluxos_geo <- fluxos_geo %>%
+  filter(!is.na(lon_orig), !is.na(lon_dest))
+
+cat("Pares com coordenadas válidas:", nrow(fluxos_geo), "\n")
+```
+
+visualizando os fluxos
+```{r}
+fluxos_geo %>%
+  group_by(nome_dest) %>%
+  summarise(total_apacs = sum(n_apacs)) %>%
+  arrange(desc(total_apacs)) %>%
+  head(10)
+```
+
+---
+
+# 6. Salvar gold
+salvando dataset gold
+
+```{r}
+glimpse(df_surv)
+```
+
+
+```{r}
+write_parquet(df_surv, "data/gold/SIA_gold_SP_2019.parquet")
+
+```
+
+```{r}
+write_parquet(fluxos_geo, "data/gold/SIA_gold_SP_geo_2019.parquet")
+
+```
+
+
+
+
+
+
+
+
+
+

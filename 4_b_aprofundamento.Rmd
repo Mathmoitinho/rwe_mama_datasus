@@ -1,0 +1,217 @@
+---
+title: "RWE Câncer de Mama — Trajetórias terapêuticas no SUS"
+output: html_notebook
+data: "2026-04-12"
+#Aprofundamento Opção B
+---
+
+```{r}
+library(arrow)       
+library(dplyr)       
+library(ggplot2)     
+library(survival)    
+library(survminer)
+library(gtsummary)   # Fromatação de Tabelas
+library(arrow)
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(geobr)
+df_surv_w <- read_parquet("Aprofundamento/df_aprofundamento.parquet")
+
+glimpse(df_surv_w)
+```
+
+# =====================================================
+# Aprofundamento Analítico: Acesso Territorial e Efetividade
+# =====================================================
+
+# 1. Aprofundamento analítico
+
+Para investigar os gargalos logísticos na jornada do paciente no SUS, exploramos o impacto do acesso territorial por meio de um termo de interação entre a complexidade do serviço (`tipo_serv`) e o `deslocamento` intermunicipal.
+
+Modelo Cox Ponderado e Duplamente Robusto com Interação
+```{r}
+cox_w_robust_int <- coxph(
+  Surv(tempo_evento, evento) ~ trat_bin + idade + estadiamento + tipo_serv + deslocamento + tipo_serv * deslocamento,
+  data = df_surv_w,
+  weights = pesos_trim,
+  robust = TRUE
+)
+
+summary(cox_w_robust_int)
+```
+
+
+plotando um forest plot complementar
+```{r}
+if(!require(ggstats)) install.packages("ggstats")
+
+ggcoef_model(cox_w_robust_int, exponentiate = TRUE)
+
+```
+
+Extraindo os resultados específicos do tratamento
+```{r}
+tabela_base_int <- tbl_regression(
+  cox_w_robust_int, 
+  exponentiate = TRUE,
+  label = list(
+    trat_bin ~ "Tratamento",
+    idade ~ "Idade",
+    estadiamento ~ "Estadiamento",
+    tipo_serv ~ "Tipo de Serviço",
+    deslocamento ~ "Deslocamento"
+  )
+)
+
+tabela_base_int
+```
+A inclusão da interação separou os efeitos.
+
+
+Para pacientes que moram na mesma cidade do centro de tratamento, tratar em um CACON é muito protetor. O risco de descontinuar cai 59% (HR = 0.41, p < 0.001) em relação a uma UNACON na mesma cidade.
+
+Se o paciente viaja para tratar em uma UNACON, o deslocamento em si também é protetor (HR = 0.51, p < 0.001). Isso sugere que o paciente só viaja para uma UNACON em outra cidade se ela for muito melhor do que a que ele tem perto de casa.
+
+O HR da interação é 2.71 (p < 0.001). Isso significa que quando um paciente precisa viajar (deslocamento intermunicipal) especificamente para um CACON, há um grande aumento no risco de abandono do tratamento (gap > 90 dias) que anula os efeitos protetores anteriores.
+
+
+---
+
+# Contexto e limitação declarada
+
+
+---
+
+# 1. Carregar dados do fluxo 
+
+```{r}
+
+fluxos_geo <- read_parquet("data/gold/SIA_gold_SP_geo_2019.parquet")
+municipios_sp <- st_read_parquet("data/bronze/municipios.parquet")
+
+```
+
+# 6. Mapa de Fluxo — Desire Lines
+
+# Visual: linhas de origem→destino, espessura proporcional ao volume.
+# Esperamos ver convergência massiva para São Paulo capital, Campinas,
+# Ribeirão Preto e Barretos — confirmando a teia de dependência logística
+# que explica o HR elevado de abandono no modelo 4b.
+
+```{r, fig.width=12, fig.height=10}
+
+# Identificar os principais destinos para destacar no mapa
+polos_destino <- fluxos_geo %>%
+  group_by(nome_dest, lon_dest, lat_dest) %>%
+  summarise(total = sum(n_apacs), .groups = "drop") %>%
+  filter(total >= quantile(total, 0.75))  # top 25% por volume
+
+ggplot() +
+  # Fundo: polígono dos municípios de SP
+  geom_sf(data = municipios_sp,
+          fill = "#1a1a2e", color = "#2d2d4e", linewidth = 0.1) +
+
+  # Desire lines: uma linha por par origem→destino
+  geom_segment(
+    data = fluxos_geo,
+    aes(x = lon_orig, y = lat_orig,
+        xend = lon_dest, yend = lat_dest,
+        linewidth = n_apacs,
+        alpha = n_apacs),
+    color = "#e74c3c",
+    lineend = "round"
+  ) +
+
+  # Polos de destino (CACONs) destacados
+  geom_point(
+    data = polos_destino,
+    aes(x = lon_dest, y = lat_dest, size = total),
+    color = "#f39c12", alpha = 0.9, shape = 16
+  ) +
+
+  # Rótulos dos principais polos
+  geom_text(
+    data = polos_destino %>% filter(total >= quantile(total, 0.9)),
+    aes(x = lon_dest, y = lat_dest, label = nome_dest),
+    color = "#f1c40f", size = 3, nudge_y = 0.15, fontface = "bold"
+  ) +
+
+  scale_linewidth_continuous(range = c(0.2, 3), guide = "none") +
+  scale_alpha_continuous(range = c(0.15, 0.85), guide = "none") +
+  scale_size_continuous(range = c(2, 8), guide = "none") +
+
+  coord_sf(crs = 4326) +
+
+  labs(
+    title    = "Fluxo assistencial de pacientes com câncer de mama para CACONs — SP, 2019",
+    subtitle = "Desire lines: linhas de origem (município de residência) → destino (CACON)\nEspessura proporcional ao volume de APACs. Pontos amarelos = principais polos.",
+    caption  = paste0(
+      "Fonte: DATASUS/SIA-SUS, SP, 2019 | geobr (IBGE, 2019).\n",
+      "Limitação: fluxo no nível municipal (centroide), não por estabelecimento.\n",
+      "Apenas fluxos intermunicipais com ≥5 APACs exibidos."
+    ),
+    x = NULL, y = NULL
+  ) +
+
+  theme_void(base_size = 11) +
+  theme(
+    plot.background  = element_rect(fill = "#0d1117", color = NA),
+    panel.background = element_rect(fill = "#0d1117", color = NA),
+    plot.title       = element_text(color = "#e6edf3", size = 13, face = "bold",
+                                    margin = margin(b = 5)),
+    plot.subtitle    = element_text(color = "#8b949e", size = 9,
+                                    margin = margin(b = 10)),
+    plot.caption     = element_text(color = "#6e7681", size = 7,
+                                    margin = margin(t = 10)),
+    plot.margin      = margin(20, 20, 20, 20)
+  )
+```
+
+---
+
+# 7. Análise complementar: top pares de fluxo
+
+# Quais trajetos são mais frequentes? Isso identifica os corredores
+# críticos onde uma falha logística (falta de medicamento, greve,
+# dificuldade de transporte) impactaria mais pacientes.
+
+```{r}
+cat("=== Top 15 corredores de fluxo (origem → destino CACON) ===\n\n")
+
+fluxos_geo %>%
+  mutate(corredor = paste(nome_orig, "→", nome_dest)) %>%
+  select(corredor, n_apacs) %>%
+  arrange(desc(n_apacs)) %>%
+  head(15) %>%
+  print()
+```
+
+---
+
+# 8. Interpretação — Market Access
+
+# O mapa materializa o achado estatístico do modelo 4b:
+#
+# HR = 2.71 para (CACON + deslocamento intermunicipal)
+#
+# Cada linha no mapa = uma trajetória real de paciente que viajou
+# para receber tratamento de alta complexidade. Quanto mais espessa
+# a linha, maior o volume de pessoas submetidas a esse esforço logístico.
+#
+# Implicações para Market Access:
+# 1. Municípios de origem com muitas linhas saindo = candidatos prioritários
+#    para expansão de UNACONs ou credenciamento de novos CACONs.
+# 2. O gargalo não é necessariamente a disponibilidade do medicamento —
+#    é a capacidade logística do paciente de manter o tratamento continuado.
+# 3. Programas de Suporte ao Paciente (PSP) deveriam priorizar pacientes
+#    intermunicipais em CACONs — exatamente o grupo com maior HR de abandono.
+#
+# Limitação para o README: a interação CACON + intermunicipal pode estar
+# capturando pacientes mais graves (que viajam mais para centros de
+# referência) e não apenas o efeito da distância. Isso é confundimento
+# residual não controlado pelo IPTW.
+
+---
+

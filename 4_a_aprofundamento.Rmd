@@ -1,0 +1,98 @@
+---
+title: "RWE Câncer de Mama — Trajetórias terapêuticas no SUS"
+output: html_notebook
+data: "2026-04-12"
+#Aprofundamento Opção A
+---
+
+```{r}
+library(arrow)       
+library(dplyr)       
+library(ggplot2)     
+library(survival)    
+library(survminer)
+library(gtsummary)   
+df_surv_w <- read_parquet("Aprofundamento/df_aprofundamento.parquet")
+
+
+glimpse(df_surv_w)
+```
+
+===============================================================
+# Aprofundamento (Fase 3): Ciência de Dados e Predição de Risco
+=============================================================
+
+
+Como extensão do nosso estudo inferencial, propomos um modelo preditivo focado na identificação antecipada de pacientes com alto risco de descontinuação (gap > 90 dias). Este tipo de algoritmo pode embasar a alocação de Programas de Suporte ao Paciente (PSP).
+
+Utilizamos uma Regressão Logística com validação cruzada (*10-fold Cross-Validation*) para garantir que a performance do modelo não sofra de *overfitting* e seja generalizável.
+
+```{r}
+if(!require(caret)){install.packages("caret")}
+if(!require(pROC)){install.packages("pROC")}
+
+# Preparando a base para o modelo (removendo NA's nas covariáveis de interesse)
+df_ml <- df_surv_w %>%
+  select(evento, trat_bin, idade, estadiamento, tipo_serv, deslocamento) %>%
+  mutate(evento = as.factor(ifelse(evento == 1, "Descontinuou", "Persistiu"))) %>%
+  na.omit()
+
+# Configurando o controle de treino: 10-fold CV
+train_control <- trainControl(
+  method = "cv", number = 10,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"   # ← adicionar
+)
+
+# Treinando o modelo preditivo
+set.seed(123)
+modelo_pred <- train(
+  evento ~ trat_bin + idade + estadiamento + tipo_serv * deslocamento,
+  data = df_ml,
+  method = "glm",
+  family = "binomial",
+  trControl = train_control,
+  metric = "ROC"
+)
+
+# Resumo do Modelo
+print(modelo_pred)
+```
+
+Extrair predições OOF
+```{r}
+prob_oof <- modelo_pred$pred
+```
+
+Gerar a Curva ROC
+```{r}
+curva_roc <- roc(
+  prob_oof$obs, 
+  prob_oof$Descontinuou,
+  levels = c("Persistiu", "Descontinuou")
+)
+```
+
+```{r}
+plot(
+  curva_roc, 
+  col = "#2980b9", 
+  lwd = 2, 
+  main = paste("Curva ROC Honesta (CV)\nAUC =", round(auc(curva_roc), 3))
+)
+```
+
+
+
+
+Extraindo e plotando a Importância das Variáveis
+```{r}
+
+importancia <- varImp(modelo_pred)
+
+plot(importancia, 
+     main = "O que mais impacta o risco de abandono?", 
+     col = "#2c3e50")
+```
+
